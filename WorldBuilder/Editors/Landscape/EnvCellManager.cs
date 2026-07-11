@@ -918,7 +918,7 @@ namespace WorldBuilder.Editors.Landscape {
         /// Renders all loaded dungeon cells. Must be called on the GL thread.
         /// The caller is expected to have already set up depth test, blend, etc.
         /// </summary>
-        public unsafe void Render(Matrix4x4 viewProjection, ICamera camera, Vector3 lightDirection, float ambientIntensity, float specularPower) {
+        public unsafe void Render(Matrix4x4 viewProjection, ICamera camera, Vector3 lightDirection, float ambientIntensity, float specularPower, float? sectionCutWorldZ = null) {
             if (_loadedCells.Count == 0) return;
 
             var gl = _renderer.GraphicsDevice.GL;
@@ -939,6 +939,8 @@ namespace WorldBuilder.Editors.Landscape {
             _shader.SetUniform("uLightDirection", Vector3.Normalize(lightDirection));
             _shader.SetUniform("uAmbientIntensity", ambientIntensity);
             _shader.SetUniform("uSpecularPower", specularPower);
+            _shader.SetUniform("uCutEnabled", sectionCutWorldZ != null ? 1 : 0);
+            _shader.SetUniform("uCutHeight", sectionCutWorldZ ?? 0f);
 
             foreach (var list in _cellGroupBuffer.Values) list.Clear();
             foreach (var list in _buildingCellGroupBuffer.Values) list.Clear();

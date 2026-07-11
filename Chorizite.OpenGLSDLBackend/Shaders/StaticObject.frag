@@ -22,9 +22,16 @@ uniform vec3 uFogColor;
 uniform float uFogStart;
 uniform float uFogEnd;
 
+// Horizontal section cut (dollhouse/cutaway views): discard everything above uCutHeight (world Z).
+// uCutEnabled is an int so render paths that never set it (default 0) are unaffected.
+uniform int uCutEnabled;
+uniform float uCutHeight;
+
 out vec4 FragColor;
 
 void main() {
+    if (uCutEnabled == 1 && vWorldPos.z > uCutHeight) discard;
+
     vec4 color = texture(uTextureArray, vec3(TexCoord, TextureIndex));
     // For normal objects vAlpha == 1.0; for animated particles vAlpha is the interpolated translucency.
     float effectiveAlpha = color.a * vAlpha;

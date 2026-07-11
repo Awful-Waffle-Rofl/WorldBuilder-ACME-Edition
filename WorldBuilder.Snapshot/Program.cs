@@ -42,6 +42,8 @@ namespace WorldBuilder.Snapshot {
             var height = 800;
             var frames = 240;
             var datPath = @"C:\ACE\Dats";
+            var view = "auto";      // auto (inside) | overview (fitted tilted top view with roof cut)
+            float? cutZ = null;     // landblock-frame Z; geometry above it is sliced off
 
             foreach (var arg in args) {
                 if (!arg.StartsWith("--")) continue;
@@ -59,11 +61,13 @@ namespace WorldBuilder.Snapshot {
                     case "height": height = int.Parse(value); break;
                     case "frames": frames = int.Parse(value); break;
                     case "dats": datPath = value; break;
+                    case "view": view = value.ToLowerInvariant(); break;
+                    case "cutz": cutZ = float.Parse(value, CultureInfo.InvariantCulture); break;
                 }
             }
 
             if (landblock == null || pngPath == null) {
-                Console.WriteLine("Usage: WorldBuilder.Snapshot --landblock=0x0066 --png=out.png [--campos=x,y,z --lookat=x,y,z] [--width=1280] [--height=800] [--frames=240] [--dats=C:\\ACE\\Dats]");
+                Console.WriteLine("Usage: WorldBuilder.Snapshot --landblock=0x0066 --png=out.png [--view=overview] [--cutz=<localZ>] [--campos=x,y,z --lookat=x,y,z] [--width=1280] [--height=800] [--frames=240] [--dats=C:\\ACE\\Dats]");
                 return 1;
             }
 
@@ -149,8 +153,34 @@ namespace WorldBuilder.Snapshot {
             }
             var worldOffset = probe.WorldPosition - probeDatCell.Position.Origin;
 
+            if (cutZ != null)
+                scene.SectionCutWorldZ = cutZ.Value + worldOffset.Z;
+
             Vector3 eye, target;
-            if (camPos != null && lookAt != null) {
+            if (view == "overview") {
+                // dollhouse view: whole dungeon in frame from a tilted top angle, roof sliced off by the
+                // shader section cut so the interior reads in 3D against the void
+                var min = new Vector3(float.MaxValue);
+                var max = new Vector3(float.MinValue);
+                foreach (var cell in cells) {
+                    min = Vector3.Min(min, cell.WorldPosition);
+                    max = Vector3.Max(max, cell.WorldPosition);
+                }
+                var mid = (min + max) / 2;
+                var extent = max - min;
+
+                // default cut low enough that mid-level floors (galleries, walkways) don't lid the view;
+                // multi-level dungeons often still want an explicit --cutz below/above a specific floor
+                if (cutZ == null)
+                    scene.SectionCutWorldZ = min.Z + Math.Max(extent.Z * 0.45f, 4f);
+
+                var distance = Math.Max(Math.Max(extent.X * 1.05f, extent.Y * 1.35f), 30f);
+
+                // ~58 degrees above horizontal, looking north-up across the layout
+                eye = mid + new Vector3(0, -distance * 0.53f, distance * 0.85f);
+                target = new Vector3(mid.X, mid.Y, min.Z);
+            }
+            else if (camPos != null && lookAt != null) {
                 eye = camPos.Value + worldOffset;
                 target = lookAt.Value + worldOffset;
             }
@@ -206,7 +236,10 @@ namespace WorldBuilder.Snapshot {
             Console.WriteLine($"[snapshot] 0x{landblock.Value:X4} -> {pngPath}");
             if (center != null)
                 Console.WriteLine($"[snapshot] dungeon center (landblock frame): {center.Value.X:0.#},{center.Value.Y:0.#},{center.Value.Z:0.#}");
-            Console.WriteLine($"[snapshot] camera: {(camPos != null ? $"local pos {camPos.Value} look {lookAt!.Value}" : "auto (inside loaded-cell bounds)")}");
+            var cameraLabel = view == "overview" ? "overview (fitted tilted top view)"
+                : camPos != null ? $"local pos {camPos.Value} look {lookAt!.Value}"
+                : "auto (inside loaded-cell bounds)";
+            Console.WriteLine($"[snapshot] camera: {cameraLabel}{(scene.SectionCutWorldZ != null ? $", section cut at local z {scene.SectionCutWorldZ.Value - worldOffset.Z:0.#}" : "")}");
 
             window.Close();
             return 0;

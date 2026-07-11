@@ -556,6 +556,12 @@ namespace WorldBuilder.Editors.Dungeon {
         public Landscape.EnvCellManager? EnvCells => _sceneContext?.EnvCellManager;
 
         /// <summary>
+        /// Horizontal section cut (world Z) for dollhouse/cutaway views: geometry and statics above this
+        /// height are discarded in the fragment shader. Null = no cut (normal rendering).
+        /// </summary>
+        public float? SectionCutWorldZ { get; set; }
+
+        /// <summary>
         /// Process pending GPU uploads and render the dungeon cells.
         /// Must be called on the GL thread.
         /// </summary>
@@ -625,7 +631,7 @@ namespace WorldBuilder.Editors.Dungeon {
                 RenderGrid(gl, viewProjection);
             }
 
-            ecm.Render(viewProjection, Camera, lightDir, ambient, specular);
+            ecm.Render(viewProjection, Camera, lightDir, ambient, specular, SectionCutWorldZ);
 
             // Process model warmup/uploads for static objects
             ProcessModelUploads();
@@ -769,6 +775,8 @@ namespace WorldBuilder.Editors.Dungeon {
             objectManager._objectShader.SetUniform("uSpecularPower", 16f);
             objectManager._objectShader.SetUniform("uHighlightColor", Vector3.Zero);
             objectManager._objectShader.SetUniform("uHighlightIntensity", 0f);
+            objectManager._objectShader.SetUniform("uCutEnabled", SectionCutWorldZ != null ? 1 : 0);
+            objectManager._objectShader.SetUniform("uCutHeight", SectionCutWorldZ ?? 0f);
 
             foreach (var list in _objectGroupBuffer.Values) list.Clear();
 
@@ -1041,6 +1049,8 @@ namespace WorldBuilder.Editors.Dungeon {
 
             objectManager._objectShader.SetUniform("uHighlightColor", Vector3.Zero);
             objectManager._objectShader.SetUniform("uHighlightIntensity", 0f);
+            objectManager._objectShader.SetUniform("uCutEnabled", SectionCutWorldZ != null ? 1 : 0);
+            objectManager._objectShader.SetUniform("uCutHeight", SectionCutWorldZ ?? 0f);
             gl.DepthMask(true);
             gl.BindVertexArray(0);
             gl.UseProgram(0);
@@ -1182,6 +1192,8 @@ namespace WorldBuilder.Editors.Dungeon {
 
             objectManager._objectShader.SetUniform("uHighlightColor", Vector3.Zero);
             objectManager._objectShader.SetUniform("uHighlightIntensity", 0f);
+            objectManager._objectShader.SetUniform("uCutEnabled", SectionCutWorldZ != null ? 1 : 0);
+            objectManager._objectShader.SetUniform("uCutHeight", SectionCutWorldZ ?? 0f);
             gl.BindVertexArray(0);
             gl.UseProgram(0);
             gl.Enable(EnableCap.CullFace);
