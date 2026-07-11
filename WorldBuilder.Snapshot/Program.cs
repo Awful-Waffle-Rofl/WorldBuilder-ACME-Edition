@@ -174,10 +174,17 @@ namespace WorldBuilder.Snapshot {
                 if (cutZ == null)
                     scene.SectionCutWorldZ = min.Z + Math.Max(extent.Z * 0.45f, 4f);
 
-                var distance = Math.Max(Math.Max(extent.X * 1.05f, extent.Y * 1.35f), 30f);
+                // fit the layout's bounding circle to the camera's actual vertical FOV, with a small margin
+                // so the widest edge nearly reaches the frame
+                var radius = MathF.Sqrt(extent.X * extent.X + extent.Y * extent.Y) / 2f + 8f;
+                var fovRadians = (float)(settings.Landscape.Camera.FieldOfView * Math.PI / 180.0);
+                var distance = Math.Max(radius / MathF.Tan(fovRadians / 2f), 25f);
 
-                // ~58 degrees above horizontal, looking north-up across the layout
-                eye = mid + new Vector3(0, -distance * 0.53f, distance * 0.85f);
+                // ~38 degrees above horizontal, approaching from +Y: the scene's inverted vertical
+                // convention (worldUp = -Z, left-handed matrices) makes this the side that reads as
+                // "viewed from above" in the captured frame
+                const float elevation = 38f * MathF.PI / 180f;
+                eye = mid + new Vector3(0, distance * MathF.Cos(elevation), distance * MathF.Sin(elevation));
                 target = new Vector3(mid.X, mid.Y, min.Z);
             }
             else if (camPos != null && lookAt != null) {
@@ -213,18 +220,50 @@ namespace WorldBuilder.Snapshot {
                 scene.Render(aspect);
             }
 
-            // ---- read back + save -------------------------------------------------------------------
-            gl.BindFramebuffer(FramebufferTarget.Framebuffer, fbo);
-            gl.ReadBuffer(ReadBufferMode.ColorAttachment0);
+            var pixels = CaptureFrame(gl, fbo, width, height);
 
-            var pixels = new byte[width * height * 4];
-            gl.ReadPixels(0, 0, (uint)width, (uint)height, PixelFormat.Rgba, PixelType.UnsignedByte, (Span<byte>)pixels);
+            // overview: the FOV-based first fit is approximate (and perspective response to distance is
+            // nonlinear up close) - iteratively measure the rendered content's pixel bounding box and
+            // re-fit until the widest edge nearly reaches the frame. Zoom-in is clamped per pass;
+            // touching a frame edge means overflow, so back out.
+            if (view == "overview") {
+                var currentDistance = (eye - target).Length();
+                var direction = Vector3.Normalize(eye - target);
 
-            // GL reads bottom-up; also force alpha opaque
+                for (var pass = 0; pass < 7; pass++) {
+                    var content = MeasureContent(pixels, width, height);
+                    if (content.Width <= 0) break;
+
+                    float factor;
+                    if (content.TouchesEdge)
+                        factor = 1.25f;                                     // overflow - back out
+                    else {
+                        var fill = Math.Max(content.Width / (width * 0.85f), content.Height / (height * 0.85f));
+                        if (fill > 0.88f) break;                            // fitted, nothing clipped
+                        factor = Math.Max(fill, 0.7f);                      // clamped zoom-in
+                    }
+
+                    currentDistance *= factor;
+                    scene.Camera.SetPosition(target + direction * currentDistance);
+                    scene.Camera.LookAt(target);
+
+                    for (var frame = 0; frame < 20; frame++) {
+                        gl.BindFramebuffer(FramebufferTarget.Framebuffer, fbo);
+                        scene.Render(aspect);
+                    }
+                    pixels = CaptureFrame(gl, fbo, width, height);
+                }
+            }
+
+            // GL reads bottom-up; force alpha opaque. Overview frames additionally mirror horizontally:
+            // the scene's inverted vertical convention (worldUp = -Z, left-handed matrices) means the
+            // from-north approach that reads correctly as "viewed from above" arrives east-west flipped.
+            var mirrorX = view == "overview";
             using var image = new Image<Rgba32>(width, height);
             for (var y = 0; y < height; y++) {
                 for (var x = 0; x < width; x++) {
-                    var i = ((height - 1 - y) * width + x) * 4;
+                    var srcX = mirrorX ? width - 1 - x : x;
+                    var i = ((height - 1 - y) * width + srcX) * 4;
                     image[x, y] = new Rgba32(pixels[i], pixels[i + 1], pixels[i + 2], 255);
                 }
             }
@@ -243,6 +282,37 @@ namespace WorldBuilder.Snapshot {
 
             window.Close();
             return 0;
+        }
+
+        private static byte[] CaptureFrame(GL gl, uint fbo, int width, int height) {
+            gl.BindFramebuffer(FramebufferTarget.Framebuffer, fbo);
+            gl.ReadBuffer(ReadBufferMode.ColorAttachment0);
+
+            var pixels = new byte[width * height * 4];
+            gl.ReadPixels(0, 0, (uint)width, (uint)height, PixelFormat.Rgba, PixelType.UnsignedByte, (Span<byte>)pixels);
+            return pixels;
+        }
+
+        /// <summary>
+        /// Pixel bounding box of everything brighter than the scene's near-black clear color.
+        /// </summary>
+        private static (int Width, int Height, bool TouchesEdge) MeasureContent(byte[] pixels, int width, int height) {
+            int minX = width, minY = height, maxX = -1, maxY = -1;
+            for (var y = 0; y < height; y++) {
+                for (var x = 0; x < width; x++) {
+                    var i = (y * width + x) * 4;
+                    if (pixels[i] + pixels[i + 1] + pixels[i + 2] > 48) {
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+                    }
+                }
+            }
+            if (maxX < 0)
+                return (0, 0, false);
+            var touchesEdge = minX <= 1 || minY <= 1 || maxX >= width - 2 || maxY >= height - 2;
+            return (maxX - minX + 1, maxY - minY + 1, touchesEdge);
         }
 
         private static IWindow CreateHiddenWindow(int width, int height, out string apiUsed) {
