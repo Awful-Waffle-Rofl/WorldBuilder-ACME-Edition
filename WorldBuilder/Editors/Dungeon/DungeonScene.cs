@@ -550,6 +550,12 @@ namespace WorldBuilder.Editors.Dungeon {
         public void InvalidateGrid() => _gridDirty = true;
 
         /// <summary>
+        /// The scene's EnvCellManager, for headless drivers (WorldBuilder.Snapshot) that need loaded-cell
+        /// world positions to place a camera. Null until InitGpu.
+        /// </summary>
+        public Landscape.EnvCellManager? EnvCells => _sceneContext?.EnvCellManager;
+
+        /// <summary>
         /// Process pending GPU uploads and render the dungeon cells.
         /// Must be called on the GL thread.
         /// </summary>

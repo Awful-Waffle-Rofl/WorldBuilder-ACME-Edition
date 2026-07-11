@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Description>Headless dungeon-interior snapshot tool: renders a dungeon landblock through the same
+DungeonScene/EnvCellManager/StaticObjectManager pipeline the Dungeon editor viewport uses (full cell
+geometry, surfaces, baked decor statics, portal visibility), into an offscreen framebuffer, saved as PNG.
+Built for catalog-driven dungeon selection workflows that need real interior images without a UI session.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WorldBuilder\WorldBuilder.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Silk.NET.Windowing" Version="2.22.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.9" />
+  </ItemGroup>
+
+</Project>
