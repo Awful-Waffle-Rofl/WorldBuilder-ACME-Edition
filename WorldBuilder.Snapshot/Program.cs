@@ -11,6 +11,7 @@ using Silk.NET.Windowing;
 
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
 
 using Chorizite.OpenGLSDLBackend;
 
@@ -174,18 +175,22 @@ namespace WorldBuilder.Snapshot {
                 if (cutZ == null)
                     scene.SectionCutWorldZ = min.Z + Math.Max(extent.Z * 0.45f, 4f);
 
-                // fit the layout's bounding circle to the camera's actual vertical FOV, with a small margin
-                // so the widest edge nearly reaches the frame
+                // fit the layout's bounding circle to the vertical FOV, with a small margin - refined
+                // below by measuring the actual rendered content
                 var radius = MathF.Sqrt(extent.X * extent.X + extent.Y * extent.Y) / 2f + 8f;
                 var fovRadians = (float)(settings.Landscape.Camera.FieldOfView * Math.PI / 180.0);
                 var distance = Math.Max(radius / MathF.Tan(fovRadians / 2f), 25f);
 
-                // ~38 degrees above horizontal, approaching from +Y: the scene's inverted vertical
-                // convention (worldUp = -Z, left-handed matrices) makes this the side that reads as
-                // "viewed from above" in the captured frame
+                // ~38 degrees above horizontal from the south, north at the top of frame. The overview
+                // path bypasses PerspectiveCamera entirely (its worldUp = -Z left-handed convention reads
+                // upside-down in top views) and injects a conventional right-handed view-projection.
                 const float elevation = 38f * MathF.PI / 180f;
-                eye = mid + new Vector3(0, distance * MathF.Cos(elevation), distance * MathF.Sin(elevation));
+                eye = mid + new Vector3(0, -distance * MathF.Cos(elevation), distance * MathF.Sin(elevation));
                 target = new Vector3(mid.X, mid.Y, min.Z);
+
+                scene.OverrideViewProjection =
+                    Matrix4x4.CreateLookAt(eye, target, Vector3.UnitZ) *
+                    Matrix4x4.CreatePerspectiveFieldOfView(fovRadians, aspect, 1f, 4000f);
             }
             else if (camPos != null && lookAt != null) {
                 eye = camPos.Value + worldOffset;
@@ -229,6 +234,7 @@ namespace WorldBuilder.Snapshot {
             if (view == "overview") {
                 var currentDistance = (eye - target).Length();
                 var direction = Vector3.Normalize(eye - target);
+                var fovRadians = (float)(settings.Landscape.Camera.FieldOfView * Math.PI / 180.0);
 
                 for (var pass = 0; pass < 7; pass++) {
                     var content = MeasureContent(pixels, width, height);
@@ -244,8 +250,11 @@ namespace WorldBuilder.Snapshot {
                     }
 
                     currentDistance *= factor;
-                    scene.Camera.SetPosition(target + direction * currentDistance);
-                    scene.Camera.LookAt(target);
+                    var newEye = target + direction * currentDistance;
+                    scene.Camera.SetPosition(newEye);   // keep visibility culling in sync
+                    scene.OverrideViewProjection =
+                        Matrix4x4.CreateLookAt(newEye, target, Vector3.UnitZ) *
+                        Matrix4x4.CreatePerspectiveFieldOfView(fovRadians, aspect, 1f, 4000f);
 
                     for (var frame = 0; frame < 20; frame++) {
                         gl.BindFramebuffer(FramebufferTarget.Framebuffer, fbo);
@@ -255,16 +264,27 @@ namespace WorldBuilder.Snapshot {
                 }
             }
 
-            // GL reads bottom-up; force alpha opaque. Overview frames additionally mirror horizontally:
-            // the scene's inverted vertical convention (worldUp = -Z, left-handed matrices) means the
-            // from-north approach that reads correctly as "viewed from above" arrives east-west flipped.
-            var mirrorX = view == "overview";
+            // GL reads bottom-up; force alpha opaque
             using var image = new Image<Rgba32>(width, height);
             for (var y = 0; y < height; y++) {
                 for (var x = 0; x < width; x++) {
-                    var srcX = mirrorX ? width - 1 - x : x;
-                    var i = ((height - 1 - y) * width + srcX) * 4;
+                    var i = ((height - 1 - y) * width + x) * 4;
                     image[x, y] = new Rgba32(pixels[i], pixels[i + 1], pixels[i + 2], 255);
+                }
+            }
+
+            // overview: crop to the content plus a slim margin so the saved image carries almost no void
+            if (view == "overview") {
+                var box = MeasureContentBox(pixels, width, height);
+                if (box != null) {
+                    const int margin = 24;
+                    var (minPx, minPy, maxPx, maxPy) = box.Value;
+                    // pixel bbox was measured on the raw (bottom-up) buffer - flip its Y for image space
+                    var top = Math.Max(height - 1 - maxPy - margin, 0);
+                    var bottom = Math.Min(height - 1 - minPy + margin, height - 1);
+                    var left = Math.Max(minPx - margin, 0);
+                    var right = Math.Min(maxPx + margin, width - 1);
+                    image.Mutate(ctx => ctx.Crop(new SixLabors.ImageSharp.Rectangle(left, top, right - left + 1, bottom - top + 1)));
                 }
             }
 
@@ -294,9 +314,10 @@ namespace WorldBuilder.Snapshot {
         }
 
         /// <summary>
-        /// Pixel bounding box of everything brighter than the scene's near-black clear color.
+        /// Pixel bounding box (raw buffer coordinates) of everything brighter than the scene's
+        /// near-black clear color. Null if nothing rendered.
         /// </summary>
-        private static (int Width, int Height, bool TouchesEdge) MeasureContent(byte[] pixels, int width, int height) {
+        private static (int MinX, int MinY, int MaxX, int MaxY)? MeasureContentBox(byte[] pixels, int width, int height) {
             int minX = width, minY = height, maxX = -1, maxY = -1;
             for (var y = 0; y < height; y++) {
                 for (var x = 0; x < width; x++) {
@@ -309,8 +330,14 @@ namespace WorldBuilder.Snapshot {
                     }
                 }
             }
-            if (maxX < 0)
+            return maxX < 0 ? null : (minX, minY, maxX, maxY);
+        }
+
+        private static (int Width, int Height, bool TouchesEdge) MeasureContent(byte[] pixels, int width, int height) {
+            var box = MeasureContentBox(pixels, width, height);
+            if (box == null)
                 return (0, 0, false);
+            var (minX, minY, maxX, maxY) = box.Value;
             var touchesEdge = minX <= 1 || minY <= 1 || maxX >= width - 2 || maxY >= height - 2;
             return (maxX - minX + 1, maxY - minY + 1, touchesEdge);
         }

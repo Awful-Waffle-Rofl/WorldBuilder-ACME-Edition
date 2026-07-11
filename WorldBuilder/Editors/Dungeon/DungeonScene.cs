@@ -562,6 +562,14 @@ namespace WorldBuilder.Editors.Dungeon {
         public float? SectionCutWorldZ { get; set; }
 
         /// <summary>
+        /// When set, Render uses this view-projection instead of deriving one from Camera - lets headless
+        /// drivers (WorldBuilder.Snapshot) supply a conventionally-handed camera for top-down captures,
+        /// where PerspectiveCamera's inverted vertical convention (worldUp = -Z, left-handed matrices)
+        /// reads upside-down. Camera.Position should still be kept roughly in sync for visibility culling.
+        /// </summary>
+        public Matrix4x4? OverrideViewProjection { get; set; }
+
+        /// <summary>
         /// Process pending GPU uploads and render the dungeon cells.
         /// Must be called on the GL thread.
         /// </summary>
@@ -594,6 +602,21 @@ namespace WorldBuilder.Editors.Dungeon {
 
             gl.Enable(EnableCap.CullFace);
             gl.CullFace(TriangleFace.Back);
+
+            if (OverrideViewProjection != null) {
+                // headless capture path: cells + statics only, no editor overlays
+                var overrideEcm = _sceneContext!.EnvCellManager;
+                UpdatePreviewLandblock(overrideEcm);
+                overrideEcm.ProcessUploads(maxPerFrame: 2);
+
+                var overrideLightDir = Vector3.Normalize(new Vector3(0.3f, -0.5f, -0.8f));
+                overrideEcm.Render(OverrideViewProjection.Value, Camera, overrideLightDir, 0.4f, 16f, SectionCutWorldZ);
+
+                ProcessModelUploads();
+                if (_dungeonStatics.Count > 0)
+                    RenderStaticObjects(gl, OverrideViewProjection.Value);
+                return;
+            }
 
             Matrix4x4 view, projection;
             if (UseOrthographic) {
