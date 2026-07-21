@@ -1,5 +1,6 @@
 using System;
 using System.Globalization;
+using System.Linq;
 using System.IO;
 using System.Numerics;
 
@@ -18,20 +19,37 @@ using Chorizite.OpenGLSDLBackend;
 using DatReaderWriter.Options;
 
 using WorldBuilder.Editors.Dungeon;
+using WorldBuilder.Editors.Landscape;
 using WorldBuilder.Lib.Settings;
+using WorldBuilder.Shared.Documents;
 using WorldBuilder.Shared.Lib;
+using WorldBuilder.Shared.Models;
 
 namespace WorldBuilder.Snapshot {
     /// <summary>
-    /// Headless dungeon-interior renderer. Drives the Dungeon editor's own scene
-    /// (DungeonScene -> EnvCellManager + StaticObjectManager: real cell geometry, surfaces, baked decor,
-    /// portal visibility) against an invisible GL window and an offscreen FBO - no Avalonia, no project,
+    /// Headless renderer for both halves of the world.
+    ///
+    /// DUNGEON INTERIORS (default): drives the Dungeon editor's own scene (DungeonScene ->
+    /// EnvCellManager + StaticObjectManager: real cell geometry, surfaces, baked decor, portal
+    /// visibility) against an invisible GL window and an offscreen FBO - no Avalonia, no project,
     /// reads retail dats directly.
+    ///
+    /// OUTDOOR TERRAIN (--view=landscape): drives the Landscape editor's GameScene the same way -
+    /// real terrain geometry, blended surface textures, scenery and building statics. Used for siting
+    /// "outdoor dungeons" (see the ACE repo's Docs/Outdoor-Dungeons/DESIGN.md), where surfacemap answers
+    /// "will this ground work" and this answers "what does the place look like".
+    ///
+    /// Unlike DungeonScene, the landscape scene hangs off a TerrainSystem, which wants a Project and a
+    /// DocumentManager. Both are built here in-memory against a scratch directory: no dats are copied,
+    /// no project is saved, and an empty document set means the terrain resolves straight from the dats
+    /// (TerrainDocument seeds its base cache from them), which is exactly the retail world we want.
     ///
     /// Usage:
     ///   WorldBuilder.Snapshot --landblock=0x0066 --png=out.png
+    ///       [--view=overview|landscape]
     ///       [--campos=x,y,z --lookat=x,y,z]   camera in landblock-frame coords (same space as
     ///                                          landblock_instance origins / @loc); omit for auto-framing
+    ///       [--elevation=38] [--heading=S|N|W|E]   landscape framing controls
     ///       [--width=1280] [--height=800] [--frames=240] [--dats=C:\ACE\Dats]
     /// </summary>
     internal static class Program {
@@ -41,10 +59,12 @@ namespace WorldBuilder.Snapshot {
             Vector3? camPos = null, lookAt = null;
             var width = 1280;
             var height = 800;
-            var frames = 240;
+            var frames = 240;   // landscape mode treats this as a CAP and stops once chunks settle
             var datPath = @"C:\ACE\Dats";
-            var view = "auto";      // auto (inside) | overview (fitted tilted top view with roof cut)
+            var view = "auto";      // auto (inside) | overview (fitted tilted top view with roof cut) | landscape
             float? cutZ = null;     // landblock-frame Z; geometry above it is sliced off
+            var camElevation = 38f; // landscape: degrees above horizontal
+            var heading = "S";      // landscape: which side the camera sits on
 
             foreach (var arg in args) {
                 if (!arg.StartsWith("--")) continue;
@@ -64,13 +84,19 @@ namespace WorldBuilder.Snapshot {
                     case "dats": datPath = value; break;
                     case "view": view = value.ToLowerInvariant(); break;
                     case "cutz": cutZ = float.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "elevation": camElevation = float.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "heading": heading = value.ToUpperInvariant(); break;
                 }
             }
 
             if (landblock == null || pngPath == null) {
-                Console.WriteLine("Usage: WorldBuilder.Snapshot --landblock=0x0066 --png=out.png [--view=overview] [--cutz=<localZ>] [--campos=x,y,z --lookat=x,y,z] [--width=1280] [--height=800] [--frames=240] [--dats=C:\\ACE\\Dats]");
+                Console.WriteLine("Usage: WorldBuilder.Snapshot --landblock=0x0066 --png=out.png [--view=overview|landscape] [--cutz=<localZ>] [--campos=x,y,z --lookat=x,y,z] [--elevation=38] [--heading=S|N|W|E] [--width=1280] [--height=800] [--frames=240] [--dats=C:\\ACE\\Dats]");
                 return 1;
             }
+
+            if (view == "landscape")
+                return RenderLandscape(landblock.Value, pngPath, camPos, lookAt, width, height,
+                    args.Any(a => a.StartsWith("--frames=")) ? frames : 1800, datPath, camElevation, heading);
 
             // ---- invisible GL context ------------------------------------------------------------
             // The scene shaders are "#version 300 es" (written for Avalonia's ANGLE ES context), so try a
@@ -302,6 +328,257 @@ namespace WorldBuilder.Snapshot {
 
             window.Close();
             return 0;
+        }
+
+        /// <summary>
+        /// Outdoor terrain render, driving the Landscape editor's GameScene headlessly.
+        ///
+        /// The scene needs a TerrainSystem, which needs a Project and a DocumentManager. Both are built
+        /// in-memory here against a scratch directory - no dats copied, no project written. An empty
+        /// document set is exactly what we want: TerrainDocument seeds its base terrain cache straight
+        /// from the dats, so what renders is the retail world rather than someone's edits.
+        ///
+        /// That base cache is a scan of all 255x255 landblocks, so it is cached to disk on first run and
+        /// reused after - the scratch directory is deliberately stable, not a fresh temp folder per run.
+        /// </summary>
+        private static int RenderLandscape(uint landblock, string pngPath, Vector3? camPos, Vector3? lookAt,
+                                           int width, int height, int frames, string datPath,
+                                           float elevationDegrees, string heading) {
+            var window = CreateHiddenWindow(width, height, out var apiUsed);
+            var gl = window.CreateOpenGL();
+            Console.WriteLine($"[snapshot] GL context: {apiUsed}, renderer: {gl.GetStringS(StringName.Renderer)}");
+
+            using var loggerFactory = LoggerFactory.Create(b => b.AddSimpleConsole(o => o.SingleLine = true).SetMinimumLevel(LogLevel.Warning));
+            var renderer = new OpenGLRenderer(gl, loggerFactory.CreateLogger("Snapshot"), null!, width, height);
+
+            using var dats = new DefaultDatReaderWriter(datPath, DatAccessType.Read);
+            var settings = new WorldBuilderSettings();
+
+            var scratch = Path.Combine(Path.GetTempPath(), "WorldBuilder.Snapshot", "landscape");
+            Directory.CreateDirectory(scratch);
+
+            var storage = new FileStorageService(Path.Combine(scratch, "docs"), loggerFactory.CreateLogger<FileStorageService>());
+            var documents = new DocumentManager(storage, loggerFactory.CreateLogger<DocumentManager>()) { Dats = dats };
+            documents.SetCacheDirectory(Path.Combine(scratch, "cache"));
+
+            var project = new Project {
+                Name = "snapshot",
+                Guid = Guid.NewGuid(),
+                FilePath = Path.Combine(scratch, "snapshot.wbproj"),
+                DocumentManager = documents,
+                DatReaderWriter = dats,
+            };
+
+            // Editor defaults are tuned for an editing session, not for a documentation image: the grid
+            // overlay is on, and ambient sits at 0.45 which reads as dusk. Both are settings rather than
+            // scene state, so they have to be set before the scene reads them.
+            settings.Landscape.Grid.ShowGrid = false;
+            settings.Landscape.Rendering.LightIntensity = 0.85f;
+
+            Console.WriteLine("[snapshot] building terrain system (first run scans every landblock in the dats and caches it)...");
+            using var terrainSystem = new TerrainSystem(project, dats, settings, loggerFactory.CreateLogger<TerrainSystem>());
+            var scene = terrainSystem.Scene;
+
+            // ---- framing, in landblock-frame coordinates like the dungeon path -----------------------
+            var lbX = (landblock >> 8) & 0xFF;
+            var lbY = landblock & 0xFF;
+            var blockOrigin = new Vector3(lbX * 192f, lbY * 192f, 0);
+
+            var (minZ, maxZ) = HeightRange(dats, landblock);
+            var centre = blockOrigin + new Vector3(96, 96, (minZ + maxZ) / 2f);
+
+            Vector3 eye, target;
+            if (camPos != null && lookAt != null) {
+                eye = camPos.Value + blockOrigin;
+                target = lookAt.Value + blockOrigin;
+            }
+            else {
+                // Fit the block's real bounding sphere, not just its 192m footprint. Relief is the trap:
+                // 0x0405 spans 22-248m, so aiming at the CENTRE VERTEX height put the camera inside the
+                // mountain standing next to it. Fit the vertical extent too, and keep the eye clear of the
+                // highest ground regardless of what the elevation angle asks for.
+                var fov = (float)(settings.Landscape.Camera.FieldOfView * Math.PI / 180.0);
+                var radius = Math.Max(136f, (maxZ - minZ) / 2f);
+                var distance = radius / MathF.Tan(fov / 2f) * 1.15f;
+
+                var elevation = elevationDegrees * MathF.PI / 180f;
+                var horizontal = distance * MathF.Cos(elevation);
+
+                // the camera stands on the named side and looks in across the block
+                var offset = heading switch {
+                    "N" => new Vector3(0, horizontal, 0),
+                    "W" => new Vector3(-horizontal, 0, 0),
+                    "E" => new Vector3(horizontal, 0, 0),
+                    _ => new Vector3(0, -horizontal, 0),    // S
+                };
+
+                var eyeZ = Math.Max(centre.Z + distance * MathF.Sin(elevation), maxZ + 30f);
+                eye = new Vector3(centre.X + offset.X, centre.Y + offset.Y, eyeZ);
+                target = centre;
+            }
+
+            var camera = scene.PerspectiveCamera;
+            camera.ScreenSize = new Vector2(width, height);
+            camera.SetPosition(eye);
+            camera.LookAt(target);
+
+            Console.WriteLine($"[snapshot] eye {eye.X:0},{eye.Y:0},{eye.Z:0} -> target {target.X:0},{target.Y:0},{target.Z:0}   yaw {camera.Yaw:0.#} pitch {camera.Pitch:0.#}");
+
+            // draw distance has to cover the whole framing, or the far half of the block clips away
+            settings.Landscape.Camera.MaxDrawDistance = Math.Max(settings.Landscape.Camera.MaxDrawDistance, 6000);
+
+            // ---- offscreen FBO -----------------------------------------------------------------------
+            var fbo = gl.GenFramebuffer();
+            gl.BindFramebuffer(FramebufferTarget.Framebuffer, fbo);
+
+            var colorTex = gl.GenTexture();
+            gl.BindTexture(TextureTarget.Texture2D, colorTex);
+            unsafe {
+                gl.TexImage2D(TextureTarget.Texture2D, 0, (int)InternalFormat.Rgba8, (uint)width, (uint)height, 0, PixelFormat.Rgba, PixelType.UnsignedByte, null);
+            }
+            gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+            gl.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+            gl.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0, TextureTarget.Texture2D, colorTex, 0);
+
+            var depthRb = gl.GenRenderbuffer();
+            gl.BindRenderbuffer(RenderbufferTarget.Renderbuffer, depthRb);
+            gl.RenderbufferStorage(RenderbufferTarget.Renderbuffer, InternalFormat.Depth24Stencil8, (uint)width, (uint)height);
+            gl.FramebufferRenderbuffer(FramebufferTarget.Framebuffer, FramebufferAttachment.DepthStencilAttachment, RenderbufferTarget.Renderbuffer, depthRb);
+
+            if (gl.CheckFramebufferStatus(FramebufferTarget.Framebuffer) != GLEnum.FramebufferComplete) {
+                Console.WriteLine("Offscreen framebuffer incomplete - cannot render.");
+                return 1;
+            }
+
+            // ---- render loop -------------------------------------------------------------------------
+            // Terrain chunks, surface textures and scenery stream in over many frames, driven by
+            // TerrainSystem.Update from the camera position - the same loop the editor viewport runs.
+            //
+            // Chunk integration and GPU upload are rate-limited per frame (MaxIntegratePerFrame,
+            // MaxGpuUploadsPerFrame), so a fixed frame count is a silent correctness bug: a block that
+            // needs more than the budget renders as SKY WITH FLOATING SCENERY - it looks like a camera
+            // fault, not a half-loaded scene, and it is easy to accept as "this block is just empty".
+            // So run until the loaded-chunk count stops growing, then a little longer for the uploads
+            // behind it, rather than trusting a magic number.
+            // The convergence signal has to be THE IMAGE, not the loaded-chunk count: the count settles
+            // almost immediately (49 chunks within a second) while the geometry behind it is still being
+            // uploaded, so waiting on it stops with a frame that is 99% sky. Watch how much of the frame
+            // is still empty sky instead, and stop when that stops falling.
+            // Chunk generation runs on background threads and the render loop only polls it, so this is
+            // WALL-CLOCK bound, not frame bound: spinning frames as fast as possible does not make the
+            // terrain arrive sooner. Two traps this has to survive, both of which produced a confident
+            // all-sky image during development:
+            //   - the loaded-chunk count settles within a second while the geometry is still uploading;
+            //   - the sky fraction is perfectly STABLE at ~99.8% before any terrain appears, so plain
+            //     "stopped changing" convergence fires before the first triangle is drawn.
+            // Hence: a minimum settling time, then convergence on the image, then a hard timeout.
+            var aspect = (float)width / height;
+            var framesRun = 0;
+            var lastSky = 2f;
+            var stableBatches = 0;
+            byte[] pixels;
+
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            const double minSeconds = 4.0;
+            const double maxSeconds = 45.0;
+
+            while (true) {
+                for (var i = 0; i < 30 && framesRun < frames; i++, framesRun++) {
+                    var viewProjection = camera.GetViewMatrix() * camera.GetProjectionMatrix();
+                    terrainSystem.Update(camera.Position, viewProjection);
+                    terrainSystem.EditingContext.ClearModifiedLandblocks();
+
+                    gl.BindFramebuffer(FramebufferTarget.Framebuffer, fbo);
+                    scene.Render(camera, renderer, aspect, terrainSystem.EditingContext, width, height);
+                }
+
+                pixels = CaptureFrame(gl, fbo, width, height);
+                var sky = SkyFraction(pixels, width, height);
+
+                stableBatches = Math.Abs(sky - lastSky) < 0.0005f ? stableBatches + 1 : 0;
+                lastSky = sky;
+
+                if (clock.Elapsed.TotalSeconds > maxSeconds)
+                    break;
+
+                if (clock.Elapsed.TotalSeconds >= minSeconds && stableBatches >= 4)
+                    break;
+
+                // give the background chunk builders room rather than burning the GPU on identical frames
+                if (framesRun >= frames)
+                    System.Threading.Thread.Sleep(50);
+            }
+
+            Console.WriteLine($"[snapshot] settled after {clock.Elapsed.TotalSeconds:0.#}s / {framesRun} frames ({scene.GetLoadedChunkCount()} chunks loaded)");
+
+            // A frame that is nearly all sky means the terrain never arrived. Say so: silently writing a
+            // blue rectangle is the worst outcome, because it reads as a real empty landblock.
+            var skyFraction = SkyFraction(pixels, width, height);
+            if (skyFraction > 0.97f) {
+                Console.WriteLine($"[snapshot] WARNING: {skyFraction * 100:0.#}% of the frame is empty sky - terrain did not render.");
+                Console.WriteLine("[snapshot] Raise --frames, or check the block actually has land (ocean blocks legitimately look like this).");
+            }
+
+            // NOTE: no vertical flip here, unlike the dungeon path. PerspectiveCamera - the Landscape
+            // editor's own camera, and the one whose conventions the terrain shaders are written against -
+            // uses worldUp = -Z with left-handed matrices, so it renders the scene upside-down relative to
+            // a conventional camera. GL then reads the framebuffer bottom-up. The two cancel exactly, and
+            // reading rows in order gives an upright image; flipping as well puts the sky at the bottom.
+            using var image = new Image<Rgba32>(width, height);
+            for (var y = 0; y < height; y++) {
+                for (var x = 0; x < width; x++) {
+                    var i = (y * width + x) * 4;
+                    image[x, y] = new Rgba32(pixels[i], pixels[i + 1], pixels[i + 2], 255);
+                }
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(pngPath)) ?? ".");
+            image.SaveAsPng(pngPath);
+
+            Console.WriteLine($"[snapshot] 0x{landblock:X4} -> {pngPath}");
+            Console.WriteLine($"[snapshot] landblock world origin: {blockOrigin.X:0},{blockOrigin.Y:0}   terrain {minZ:0.#}-{maxZ:0.#}m");
+            Console.WriteLine($"[snapshot] camera: {(camPos != null ? $"local pos {camPos.Value} look {lookAt!.Value}" : $"landscape, {heading} side, {elevationDegrees:0.#} deg elevation")}");
+
+
+            window.Close();
+            return 0;
+        }
+
+        /// <summary>
+        /// Share of the frame that is the sky gradient - bluish, with blue clearly dominant and the pixel
+        /// bright. Used only to detect the "nothing loaded" failure, so it wants to be conservative:
+        /// terrain and water are never this uniformly blue-dominant AND bright.
+        /// </summary>
+        private static float SkyFraction(byte[] pixels, int width, int height) {
+            var sky = 0;
+            for (var i = 0; i < width * height; i++) {
+                int r = pixels[i * 4], g = pixels[i * 4 + 1], b = pixels[i * 4 + 2];
+                if (b > 120 && b > r + 30 && b > g + 15)
+                    sky++;
+            }
+            return (float)sky / (width * height);
+        }
+
+        /// <summary>
+        /// A landblock's terrain height range, for aiming and fitting the camera. Both ends matter: the
+        /// midpoint is what to look at, and the top is what the eye has to clear.
+        /// </summary>
+        private static (float Min, float Max) HeightRange(IDatReaderWriter dats, uint landblock) {
+            if (!dats.TryGet<DatReaderWriter.DBObjs.Region>(0x13000000, out var region))
+                return (0, 0);
+            if (!dats.TryGet<DatReaderWriter.DBObjs.LandBlock>((landblock << 16) | 0xFFFF, out var lb))
+                return (0, 0);
+
+            var table = region.LandDefs.LandHeightTable;
+            float min = float.MaxValue, max = float.MinValue;
+
+            for (var i = 0; i < 81; i++) {
+                var z = table[lb.Height[i]];
+                if (z < min) min = z;
+                if (z > max) max = z;
+            }
+
+            return (min, max);
         }
 
         private static byte[] CaptureFrame(GL gl, uint fbo, int width, int height) {

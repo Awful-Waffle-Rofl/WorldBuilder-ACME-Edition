@@ -78,8 +78,14 @@ namespace WorldBuilder.Editors.Landscape {
             collection.AddTransient<PerspectiveCamera>();
             collection.AddTransient<OrthographicTopDownCamera>();
 
-            Services = new CompositeServiceProvider(collection.BuildServiceProvider(),
-                ProjectManager.Instance.CompositeProvider);
+            // ProjectManager is the app's singleton and is null in headless hosts (WorldBuilder.Snapshot
+            // builds a Project + DocumentManager directly and never opens the UI). Its provider only adds
+            // app-level services the terrain scene does not use, so fall back to our own collection alone
+            // rather than requiring the whole application shell just to render terrain.
+            var appProvider = ProjectManager.Instance?.CompositeProvider;
+            Services = appProvider != null
+                ? new CompositeServiceProvider(collection.BuildServiceProvider(), appProvider)
+                : new CompositeServiceProvider(collection.BuildServiceProvider());
 
             Scene = new GameScene(this);
         }
