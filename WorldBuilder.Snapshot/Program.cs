@@ -20,6 +20,7 @@ using DatReaderWriter.Options;
 
 using WorldBuilder.Editors.Dungeon;
 using WorldBuilder.Editors.Landscape;
+using WorldBuilder.Lib;
 using WorldBuilder.Lib.Settings;
 using WorldBuilder.Shared.Documents;
 using WorldBuilder.Shared.Lib;
@@ -94,9 +95,10 @@ namespace WorldBuilder.Snapshot {
                 return 1;
             }
 
-            if (view == "landscape")
+            if (view == "landscape" || view == "topdown")
                 return RenderLandscape(landblock.Value, pngPath, camPos, lookAt, width, height,
-                    args.Any(a => a.StartsWith("--frames=")) ? frames : 1800, datPath, camElevation, heading);
+                    args.Any(a => a.StartsWith("--frames=")) ? frames : 1800, datPath, camElevation, heading,
+                    topDown: view == "topdown");
 
             // ---- invisible GL context ------------------------------------------------------------
             // The scene shaders are "#version 300 es" (written for Avalonia's ANGLE ES context), so try a
@@ -343,7 +345,7 @@ namespace WorldBuilder.Snapshot {
         /// </summary>
         private static int RenderLandscape(uint landblock, string pngPath, Vector3? camPos, Vector3? lookAt,
                                            int width, int height, int frames, string datPath,
-                                           float elevationDegrees, string heading) {
+                                           float elevationDegrees, string heading, bool topDown = false) {
             var window = CreateHiddenWindow(width, height, out var apiUsed);
             var gl = window.CreateOpenGL();
             Console.WriteLine($"[snapshot] GL context: {apiUsed}, renderer: {gl.GetStringS(StringName.Renderer)}");
@@ -417,12 +419,41 @@ namespace WorldBuilder.Snapshot {
                 target = centre;
             }
 
-            var camera = scene.PerspectiveCamera;
-            camera.ScreenSize = new Vector2(width, height);
-            camera.SetPosition(eye);
-            camera.LookAt(target);
+            // Top-down uses the editor's ORTHOGRAPHIC camera rather than a steeply-pitched perspective
+            // one: no perspective spread means the 192m block maps to a constant scale, so the image can
+            // be laid beside surfacemap and read as the same picture. Its own conventions are
+            // right = +X (east) and up = -Y, which after the framebuffer read lands north-up east-right,
+            // matching surfacemap - verified against 0xA7B6's water pattern, not assumed.
+            ICamera camera;
+            if (topDown) {
+                var ortho = scene.TopDownCamera;
+                ortho.ScreenSize = new Vector2(width, height);
 
-            Console.WriteLine($"[snapshot] eye {eye.X:0},{eye.Y:0},{eye.Z:0} -> target {target.X:0},{target.Y:0},{target.Z:0}   yaw {camera.Yaw:0.#} pitch {camera.Pitch:0.#}");
+                // OrthographicSize and camera altitude are the SAME FIELD in this camera - the setter for
+                // each overwrites the other, so a view width and a height cannot be chosen independently.
+                // Setting a comfortable altitude therefore silently zooms out: asking for 208m across and
+                // then lifting the camera to clear the terrain gave a ~2km view of the whole coastline.
+                // So: one call, and the number is both. 208m across a 192m block leaves a thin margin of
+                // the neighbours for context, and 208m up clears anything under ~170m; taller blocks have
+                // to zoom out to stay above their own peaks.
+                var viewSize = Math.Max(208f, maxZ + 60f);
+                ortho.SetPosition(centre.X, centre.Y, viewSize);
+
+                if (viewSize > 208f)
+                    Console.WriteLine($"[snapshot] terrain reaches {maxZ:0.#}m, so the top-down view widens to {viewSize:0}m to stay above it.");
+
+                camera = ortho;
+                Console.WriteLine($"[snapshot] top-down orthographic over {centre.X:0},{centre.Y:0}, {viewSize:0}m across");
+            }
+            else {
+                var perspective = scene.PerspectiveCamera;
+                perspective.ScreenSize = new Vector2(width, height);
+                perspective.SetPosition(eye);
+                perspective.LookAt(target);
+
+                camera = perspective;
+                Console.WriteLine($"[snapshot] eye {eye.X:0},{eye.Y:0},{eye.Z:0} -> target {target.X:0},{target.Y:0},{target.Z:0}   yaw {perspective.Yaw:0.#} pitch {perspective.Pitch:0.#}");
+            }
 
             // draw distance has to cover the whole framing, or the far half of the block clips away
             settings.Landscape.Camera.MaxDrawDistance = Math.Max(settings.Landscape.Camera.MaxDrawDistance, 6000);
